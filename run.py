@@ -11,6 +11,7 @@ from utils.print_args import print_args
 import random
 import numpy as np
 
+
 if __name__ == '__main__':
     fix_seed = 2021
     random.seed(fix_seed)
