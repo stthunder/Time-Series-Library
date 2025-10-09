@@ -173,7 +173,7 @@ class TimeVarKP(nn.Module):
         self.encoder, self.decoder = encoder, decoder            
         self.freq = math.ceil(self.input_len / self.seg_len)  # segment number of input
         self.step = math.ceil(self.pred_len / self.seg_len)   # segment number of output
-        self.padding_len = self.seg_len * self.freq - self.input_len
+        self.padding_len = self.seg_len * self.freq - self.input_len    # Number seems very small
         # Approximate mulitstep K by KPLayerApprox when pred_len is large
         self.dynamics = KPLayerApprox() if self.multistep else KPLayer() 
 
@@ -183,7 +183,7 @@ class TimeVarKP(nn.Module):
 
         res = torch.cat((x[:, L-self.padding_len:, :], x) ,dim=1)
 
-        res = res.chunk(self.freq, dim=1)     # F x B P C, P means seg_len
+        res = res.chunk(self.freq, dim=1)     # F x B P C, P means seg_len    # into segements
         res = torch.stack(res, dim=1).reshape(B, self.freq, -1)   # B F PC
 
         res = self.encoder(res) # B F H
@@ -281,7 +281,7 @@ class Model(nn.Module):
 
         # shared encoder/decoder to make koopman embedding consistent
         self.time_var_encoder = MLP(f_in=self.seg_len*self.enc_in, f_out=self.dynamic_dim, activation='tanh',
-                           hidden_dim=self.hidden_dim, hidden_layers=self.hidden_layers)
+                           hidden_dim=self.hidden_dim, hidden_layers=self.hidden_layers) #why?
         self.time_var_decoder = MLP(f_in=self.dynamic_dim, f_out=self.seg_len*self.enc_in, activation='tanh',
                            hidden_dim=self.hidden_dim, hidden_layers=self.hidden_layers)
         self.time_var_kps = nn.ModuleList([
@@ -320,7 +320,7 @@ class Model(nn.Module):
             time_var_input, time_inv_input = self.disentanglement(residual)
             time_inv_output = self.time_inv_kps[i](time_inv_input)
             time_var_backcast, time_var_output = self.time_var_kps[i](time_var_input)
-            residual = residual - time_var_backcast
+            residual = residual - time_var_backcast  # VAR for what why Residual comes from this?
             if forecast is None:
                 forecast = (time_inv_output + time_var_output)
             else:
@@ -333,5 +333,5 @@ class Model(nn.Module):
     
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         if self.task_name == 'long_term_forecast':
-            dec_out = self.forecast(x_enc)
+            dec_out = self.forecast(x_enc) # L containing label and predicted
             return dec_out[:, -self.pred_len:, :] # [B, L, D]

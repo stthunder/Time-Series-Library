@@ -20,6 +20,26 @@ class Dataset_ETT_hour(Dataset):
     def __init__(self, args, root_path, flag='train', size=None,
                  features='S', data_path='ETTh1.csv',
                  target='OT', scale=True, timeenc=0, freq='h', seasonal_patterns=None):
+
+        # -------------------------------------------------------------------------
+        # Feature selection modes for ETT dataset
+        # The parameter `features` controls which input variables are provided to the model.
+        #
+        # Value | Meaning | Input dimension | Typical usage
+        # -------------------------------------------------------------------------
+        # 'S'  : Single-variate — only the target variable is used as input.
+        #        → Uses only the target variable (e.g., OT).
+        #        → Predict future OT from its own past sequence.
+        #
+        # 'M'  : Multi-variate — all variables are used as both input and output.
+        #        → Uses all sensor variables as input.
+        #        → Predict all variables (including OT) jointly.
+        #
+        # 'MS' : Multi-to-Single — all variables as input, single target as output.
+        #        → Uses all sensor variables to predict the target variable.
+        #        → Most common setting: use HUFL, HULL, MUFL, MULL, LUFL, LULL, OT to predict OT.
+        # -------------------------------------------------------------------------
+
         # size [seq_len, label_len, pred_len]
         self.args = args
         # info
@@ -30,7 +50,7 @@ class Dataset_ETT_hour(Dataset):
         else:
             self.seq_len = size[0]
             self.label_len = size[1]
-            self.pred_len = size[2]
+            self.pred_len = size[2]  #What's label_len and what's pre_len 
         # init
         assert flag in ['train', 'test', 'val']
         type_map = {'train': 0, 'val': 1, 'test': 2}
@@ -82,7 +102,7 @@ class Dataset_ETT_hour(Dataset):
             data_stamp = data_stamp.transpose(1, 0) 
 
         self.data_x = data[border1:border2]
-        self.data_y = data[border1:border2]
+        self.data_y = data[border1:border2] #Why same?
 
         if self.set_type == 0 and self.args.augmentation_ratio > 0:
             self.data_x, self.data_y, augmentation_tags = run_augmentation_single(self.data_x, self.data_y, self.args)
@@ -191,7 +211,7 @@ class Dataset_ETT_minute(Dataset):
         r_end = r_begin + self.label_len + self.pred_len
 
         seq_x = self.data_x[s_begin:s_end]
-        seq_y = self.data_y[r_begin:r_end]
+        seq_y = self.data_y[r_begin:r_end]          #allgien them together 
         seq_x_mark = self.data_stamp[s_begin:s_end]
         seq_y_mark = self.data_stamp[r_begin:r_end]
 

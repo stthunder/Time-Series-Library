@@ -48,7 +48,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 batch_y = batch_y.float()
 
                 batch_x_mark = batch_x_mark.float().to(self.device)
-                batch_y_mark = batch_y_mark.float().to(self.device)
+                batch_y_mark = batch_y_mark.float().to(self.device) # Marker with time information
 
                 # decoder input
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
@@ -107,6 +107,16 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
 
+
+                # s_begin = index
+                # s_end = s_begin + self.seq_len
+                # r_begin = s_end - self.label_len
+                # r_end = r_begin + self.label_len + self.pred_len
+
+                # seq_x = self.data_x[s_begin:s_end]
+                # seq_y = self.data_y[r_begin:r_end]          #allgien them together 
+                # seq_x_mark = self.data_stamp[s_begin:s_end]
+                # seq_y_mark = self.data_stamp[r_begin:r_end]
                 # decoder input
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
