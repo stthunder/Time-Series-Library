@@ -7,30 +7,50 @@ from typing import Dict, Tuple
 from einops import rearrange
 from torchdiffeq import odeint
 import numpy as np
-from data_provider.data_factory import data_provider
 
 
-class FourierFilter(nn.Module):
+class PatchEmbedding(nn.Module):
     """
-    Fourier Filter: to time-variant and time-invariant term
+    Convert time series to patch embeddings
+    Input: (B, seq_len, channels)
+    Output: (B, num_patches, patch_dim)
     """
-    def __init__(self, mask_spectrum):
-        super(FourierFilter, self).__init__()
-        self.mask_spectrum = mask_spectrum
+    def __init__(self, seq_len, patch_len, stride, channels, d_model):
+        super().__init__()
+        self.patch_len = patch_len
+        self.stride = stride
+        self.channels = channels
+        
+        # Calculate number of patches
+        self.num_patches = (seq_len - patch_len) // stride + 1
+        
+        # Patch embedding: flatten patch + linear projection
+        self.patch_embedding = nn.Linear(patch_len * channels, d_model)
         
     def forward(self, x):
-        xf = torch.fft.rfft(x, dim=1)
-        mask = torch.ones_like(xf)
-        mask[:, self.mask_spectrum, :] = 0
-        x_var = torch.fft.irfft(xf*mask, dim=1)
-        x_inv = x - x_var
+        """
+        x: (B, seq_len, channels)
+        Returns: (B, num_patches, d_model)
+        """
+        B, L, C = x.shape
         
-        return x_var, x_inv
+        # Extract patches using unfold
+        # (B, C, L) -> (B, C, num_patches, patch_len)
+        x = x.transpose(1, 2)  # (B, C, L)
+        patches = x.unfold(dimension=2, size=self.patch_len, step=self.stride)
+        
+        # Reshape: (B, C, num_patches, patch_len) -> (B, num_patches, C*patch_len)
+        patches = rearrange(patches, 'b c n p -> b n (c p)')
+        
+        # Embed patches
+        patch_embed = self.patch_embedding(patches)  # (B, num_patches, d_model)
+        
+        return patch_embed
 
 
 class AODEFunc(nn.Module):
-    """d a / dt = f_a(t, a)  (a ∈ ℝ^N)"""
-    def __init__(self, N: int, hidden_dim: int = 64, dim_C: int = 64, prune_hidden: int = 32, dim_Z: int = 64):
+    """ODE dynamics for Koopman observables"""
+    def __init__(self, N: int, hidden_dim: int = 64, prune_hidden: int = 32):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(prune_hidden, hidden_dim), 
@@ -39,242 +59,248 @@ class AODEFunc(nn.Module):
             nn.Linear(hidden_dim, prune_hidden), 
             nn.Tanh(),
         )
-        self.lat2out = nn.Sequential(nn.Linear(prune_hidden, 8), nn.SiLU(), nn.Linear(8, N))
-        self.lat2out_h = nn.Sequential(nn.Linear(prune_hidden, 8), nn.SiLU(), nn.Linear(8, N))
-        self.lat2out_c = nn.Sequential(nn.Linear(prune_hidden, 8), nn.SiLU(), nn.Linear(8, dim_C))
-        self.lat2out_z = nn.Sequential(nn.Linear(N, N), nn.SiLU(), nn.Linear(N, dim_Z))
+        self.lat2out = nn.Sequential(
+            nn.Linear(prune_hidden, hidden_dim), 
+            nn.SiLU(), 
+            nn.Linear(hidden_dim, N), 
+            nn.Tanh()
+        )
 
     def forward(self, t: torch.Tensor, a: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         return self.net(a)
 
 
 class _JointODEFunc(nn.Module):
-    """Augmented dynamics for **a, z** (removed b).
-
-    Parameters
-    ----------
-    model : parent ODEPredictor (provides sub‑modules & hyper‑params)
-    context : context vector for dynamics
-    """
-    def __init__(self, model: 'ODEPredictor', context: torch.Tensor):
+    """Augmented dynamics for patch-level Koopman observables"""
+    def __init__(self, model: 'PatchKoopmanODE', context: torch.Tensor):
         super().__init__()
         self.model = model
         self.context = context
 
-    def forward(self, t: torch.Tensor, s: torch.Tensor) -> torch.Tensor:  # (B,*)
+    def forward(self, t: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
         M = self.model
         N = M.prune_hidden
-        a = s[:, :N]                  # (B,N)
-        z = s[:, N:]                  # (B,N)
         
+        if t.dim() == 0:
+            t = t.to(s.device)
+        
+        a = s[:, :N]      # (B, prune_hidden) - compressed Koopman observables
+        z = s[:, N:]      # (B, d_model) - patch representation
+        
+        # Koopman dynamics
         da = M.a_ode(t, a, self.context)
-        d = M.a_ode.lat2out(a).unsqueeze(-1)          # (B,N,1)
         
-        self.H = M.H
-        H = M.H
-        A_mat = torch.einsum('bij,bjk->bik', H.transpose(-1, -2), d * H)  # (B,N,N)
+        # Get circulant matrix first row
+        c = M.a_ode.lat2out(a)  # (B, d_model) - first row of circulant matrix
         
-        dz = (A_mat @ z.unsqueeze(-1)).squeeze(-1)  # (B,N)
+        # Construct circulant matrix from c
+        B, D = c.shape
+        circulant_matrix = torch.zeros(B, D, D, device=c.device, dtype=c.dtype)
+        
+        # Build circulant matrix: each row is cyclic shift of first row
+        for i in range(D):
+            circulant_matrix[:, i, :] = torch.roll(c, shifts=i, dims=1)
+        
+        # Matrix-vector multiplication: C @ z
+        dz = torch.bmm(circulant_matrix, z.unsqueeze(-1)).squeeze(-1)  # (B, d_model)
         
         return torch.cat([da, dz], dim=-1)
 
 
-class Householder(nn.Module):
-    """Householder reflection matrix constructor."""
-    def __init__(self, N: int):
-        super().__init__()
-        self.N = N
-    
-    def forward(self, v: torch.Tensor) -> torch.Tensor:
-        # v: (B, N)
-        device = v.device
-        v = v / (torch.norm(v, dim=-1, keepdim=True) + 1e-8)
-        I = torch.eye(self.N, device=device, dtype=v.dtype).unsqueeze(0)  # (1, N, N)
-        H = I - 2 * torch.einsum('bi,bj->bij', v, v)  # (B, N, N)
-        return H
-
-
-class ODEPredictor(nn.Module):
+class PatchKoopmanODE(nn.Module):
     """
-    ODE-based Koopman Predictor
-    Utilize neural ODE to learn dynamics in latent space
+    Patch-based Koopman ODE Predictor
+    Operates on patch-level representations
     """
     def __init__(self,
-                 enc_in=8,
-                 input_len=96,
+                 seq_len=96,
                  pred_len=96,
-                 latent_dim=64,
+                 patch_len=16,
+                 stride=8,
+                 channels=8,
+                 d_model=64,
                  hidden_dim=64,
-                 prune_hidden=8,
-                 d_conv=3):
-        super(ODEPredictor, self).__init__()
-        self.input_len = input_len
+                 prune_hidden=16):
+        super().__init__()
+        self.seq_len = seq_len
         self.pred_len = pred_len
-        self.enc_in = enc_in
-        self.N = latent_dim
+        self.patch_len = patch_len
+        self.stride = stride
+        self.channels = channels
+        self.d_model = d_model
         self.prune_hidden = prune_hidden
-        self.d_conv = d_conv
         
-        # Learnable projections
-        self.x_proj = nn.Sequential(
-            nn.Linear(self.enc_in, hidden_dim), nn.SiLU(), nn.Dropout(0.1), 
-            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Dropout(0.1), 
-            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Dropout(0.1), 
-            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Dropout(0.1), 
-            nn.Linear(hidden_dim, self.N)
+        # Patch embedding
+        self.patch_embed = PatchEmbedding(
+            seq_len=seq_len,
+            patch_len=patch_len,
+            stride=stride,
+            channels=channels,
+            d_model=d_model
         )
-        self.x_proj_ = nn.Sequential(
-            nn.Linear(self.N, hidden_dim), nn.SiLU(), 
-            nn.Dropout(0.0), nn.Linear(hidden_dim, self.N)
+        self.num_patches = self.patch_embed.num_patches
+        
+        # Calculate target number of patches for prediction
+        self.target_patches = (pred_len - 1) // stride + 1
+        
+        # Temporal convolution over patches
+        self.patch_conv = nn.Conv1d(
+            in_channels=d_model,
+            out_channels=d_model,
+            kernel_size=3,
+            padding=2,
+            groups=d_model
         )
-
-        # Conv over history
-        self.conv = nn.Conv1d(
-            in_channels=self.N,
-            out_channels=self.N,
-            kernel_size=self.d_conv,
-            padding=(self.d_conv - 1) * 2,
-            dilation=2,
-            groups=self.N
-        )
-        nn.init.kaiming_uniform_(self.conv.weight, mode="fan_in", nonlinearity="relu")
-
-        # ODE nets & helpers
-        self.span_A = nn.Parameter(torch.tensor(0.1))
+        
+        # Compress patch sequence to initial Koopman observable
         self.compress = nn.Sequential(
-            nn.Linear(self.N * self.input_len, self.prune_hidden), 
+            nn.Linear(d_model * self.num_patches, prune_hidden),
             nn.Dropout(0.1)
         )
-        dim_C = self.enc_in * self.N
-        dim_Z = self.enc_in
-        self.a_ode = AODEFunc(self.N, hidden_dim, dim_C, self.prune_hidden, dim_Z)
-        self.householder = Householder(self.N)
-        self.delta_raw = nn.Parameter(torch.zeros(self.pred_len))
         
-        self.H = None
+        # Koopman ODE
+        self.a_ode = AODEFunc(d_model, hidden_dim, prune_hidden)
+        self.span_A = nn.Parameter(torch.tensor(0.5))
+        
+        # Patch decoder: convert patch embedding back to time series
+        # self.patch_decoder = nn.Linear(d_model, patch_len * channels)
 
+        self.patch_decoder = nn.Sequential(nn.Linear(d_model, patch_len * channels),
+                                           nn.Dropout(0.1),
+                                           nn.SiLU(),
+                                           nn.Linear(patch_len * channels, patch_len * channels))
+        
     def forward(self, x):
         """
-        x: (B, L, C) input time series
+        x: (B, seq_len, channels)
         Returns:
-            x_rec: (B, L, C) reconstructed input
-            x_pred: (B, S, C) predicted future
+            x_rec: (B, seq_len, channels) reconstructed
+            x_pred: (B, pred_len, channels) predicted
         """
-        B, T, _ = x.shape
+        B, T, C = x.shape
         device = x.device
-
-        # 1) History embedding → initial a0 & z0
-        x_old = self.x_proj(x[:, :self.input_len])           # (B, L, N)
-        hist = rearrange(x_old, "B L D -> B D L")            # (B, N, L)
-        hist = F.silu(self.conv(hist))[:, :, -self.input_len:]   # (B, N, L)
-        hist = rearrange(hist, "B D L -> B L D")
-        hist_f = hist.reshape(B, -1)
-        vector_F = self.compress(hist_f)
-        a0 = vector_F
-        z0 = self.x_proj(x[:, self.input_len - 1])          # (B, N)
-        self.H = self.householder(self.x_proj_(z0))
         
-        # 2) Time span setup - ensure on correct device
-        span_A = torch.clamp(self.span_A, min=1e-8, max=7.0)
-        tspan = torch.arange(1, self.pred_len + 1, device=device, dtype=torch.float32) * span_A
-        tspan = torch.cat([torch.zeros(1, device=device, dtype=torch.float32), tspan], dim=0)
+        # 1) Patch embedding
+        patch_embed = self.patch_embed(x)  # (B, num_patches, d_model)
         
-        # 3) ODE integration
-        s0 = torch.cat([a0, z0], dim=-1)        # (B, prune_hidden+N)
-        joint_func = _JointODEFunc(self, vector_F)
-        sol = odeint(joint_func, s0, tspan, method="euler", rtol=1e-3, atol=1e-4)  # (L+1, B, D)
-
-        # 4) Decode predictions
-        z_traj = sol[1:, :, -self.N:]                      # (pred_len, B, N)
-        c_traj = sol[1:, :, :self.prune_hidden]
-        C = self.a_ode.lat2out_c(c_traj).permute(1, 0, 2).view(
-            z_traj.shape[1], z_traj.shape[0], self.enc_in, self.N
-        )
+        # 2) Temporal convolution over patches
+        patch_feat = rearrange(patch_embed, 'b n d -> b d n')
+        patch_feat = F.silu(self.patch_conv(patch_feat))[:, :, :self.num_patches]
+        patch_feat = rearrange(patch_feat, 'b d n -> b n d')
         
-        # Generate predictions
-        predictions = []
-        for k in range(self.pred_len):
-            y_hat_c = torch.einsum("bij,bj->bi", C[:, k, :], z_traj[k, :, :])
-            Added_z = self.a_ode.lat2out_z(z_traj[k])
-            y_hat = y_hat_c + Added_z
-            predictions.append(y_hat)
+        # 3) Initialize Koopman observable
+        patch_flat = patch_feat.reshape(B, -1)
+        a0 = self.compress(patch_flat)  # (B, prune_hidden)
+        z0 = patch_embed[:, -1, :]  # Last patch as initial state (B, d_model)
         
-        x_pred = torch.stack(predictions, dim=1)  # (B, pred_len, C)
+        # 4) ODE integration to evolve patches
+        span_A  = torch.clamp(self.span_A, min=1e-8, max=5.0)
+        tspan   = torch.linspace(0, float(span_A * self.target_patches), 
+                              self.target_patches + 1,
+                              device=device, dtype=x.dtype)
         
-        # Reconstruct input (simple pass-through for now)
-        x_rec = x[:, :self.input_len, :]
+        s0 = torch.cat([a0, z0], dim=-1)
+        joint_func = _JointODEFunc(self, patch_flat)
+        
+        sol = odeint(joint_func, s0, tspan, method="euler", rtol=1e-3, atol=1e-4)
+        # (target_patches+1, B, prune_hidden+d_model)
+        
+        # 5) Decode predicted patches
+        z_traj = sol[1:, :, -self.d_model:]  # (target_patches, B, d_model)
+        
+        # Convert patches back to time series
+        pred_patches = []
+        for k in range(self.target_patches):
+            patch_vec = self.patch_decoder(z_traj[k])  # (B, patch_len*channels)
+            patch_vec = patch_vec.reshape(B, self.patch_len, C)
+            pred_patches.append(patch_vec)
+        
+        # Concatenate patches with overlap handling
+        x_pred = self._reconstruct_from_patches(pred_patches)  # (B, pred_len, C)
+        
+        # Reconstruct input (simple passthrough for now)
+        x_rec = x
         
         return x_rec, x_pred
+    
+    def _reconstruct_from_patches(self, patches):
+        """
+        Reconstruct time series from overlapping patches
+        patches: list of (B, patch_len, C) tensors
+        Returns: (B, pred_len, C)
+        """
+        B = patches[0].shape[0]
+        C = patches[0].shape[2]
+        device = patches[0].device
+        
+        # Simple reconstruction: use stride to place patches
+        output = torch.zeros(B, self.pred_len, C, device=device)
+        counts = torch.zeros(B, self.pred_len, C, device=device)
+        
+        for i, patch in enumerate(patches):
+            start = i * self.stride
+            end = min(start + self.patch_len, self.pred_len)
+            patch_end = end - start
+            
+            output[:, start:end, :] += patch[:, :patch_end, :]
+            counts[:, start:end, :] += 1
+        
+        # Average overlapping regions
+        output = output / (counts + 1e-6)
+        
+        return output
 
 
 class Model(nn.Module):
     """
-    ODE-based Time Series Forecasting Model
-    Adapted to Koopa framework structure
+    Patch-based Koopman ODE Forecasting Model
     """
-    def __init__(self, configs, latent_dim=64, hidden_dim=64, num_blocks=1):
-        """
-        latent_dim: int, latent dimension of ODE embedding
-        hidden_dim: int, hidden dimension of networks
-        num_blocks: int, number of ODE blocks
-        """
-        super(Model, self).__init__()
+    def __init__(self, configs, 
+                 patch_len=48, 
+                 stride=8,
+                 d_model=64, 
+                 hidden_dim=64):
+        super().__init__()
         self.task_name = configs.task_name
-        self.enc_in = configs.enc_in
-        self.input_len = configs.seq_len
+        self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
-        self.num_blocks = num_blocks
-        self.latent_dim = latent_dim
-        self.hidden_dim = hidden_dim
+        self.channels = configs.enc_in
         
-        # ODE predictors
-        self.ode_predictors = nn.ModuleList([
-            ODEPredictor(
-                enc_in=self.enc_in,
-                input_len=self.input_len,
-                pred_len=self.pred_len,
-                latent_dim=self.latent_dim,
-                hidden_dim=self.hidden_dim
-            )
-            for _ in range(self.num_blocks)
-        ])
-
+        self.patch_len = (self.seq_len-self.pred_len)//2
+        self.stride = stride
+        
+        # Patch-based Koopman ODE predictor
+        self.predictor = PatchKoopmanODE(
+            seq_len=self.seq_len,
+            pred_len=self.pred_len,
+            patch_len=patch_len,
+            stride=stride,
+            channels=self.channels,
+            d_model=d_model,
+            hidden_dim=hidden_dim
+        )
+        
     def forecast(self, x_enc):
         """
-        Forecast future states with Series Stationarization.
-        
-        Parameters
-        ----------
-        x_enc : (B, T, S) input time series
-        
-        Returns
-        -------
-        forecast : (B, L, S) predicted future states
+        Forecast with series stationarization
         """
-        # Series Stationarization adopted from NSformer
-        mean_enc = x_enc.mean(1, keepdim=True).detach()  # B x 1 x C
+        # Stationarization
+        mean_enc = x_enc.mean(1, keepdim=True).detach()
         x_enc = x_enc - mean_enc
         std_enc = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5).detach()
         x_enc = x_enc / std_enc
-
-        # ODE Forecasting
-        residual, forecast = x_enc, None
-        for i in range(self.num_blocks):
-            x_rec, x_pred = self.ode_predictors[i](residual)
-            residual = residual - x_rec  # Update residual
-            if forecast is None:
-                forecast = x_pred
-            else:
-                forecast += x_pred
-
+        
+        # Patch-based Koopman forecasting
+        x_rec, x_pred = self.predictor(x_enc)
+        
         # De-stationarization
-        forecast = forecast * std_enc + mean_enc
-
+        forecast = x_pred * std_enc + mean_enc
+        
         return forecast
     
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         if self.task_name == 'long_term_forecast':
             dec_out = self.forecast(x_enc)
-            return dec_out[:, -self.pred_len:, :]  # [B, L, D]
+            return dec_out[:, :self.pred_len, :]
         else:
             raise NotImplementedError(f"Task {self.task_name} not implemented")
